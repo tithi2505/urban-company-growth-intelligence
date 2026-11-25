@@ -28,6 +28,46 @@ def secret(name, default=""):
     except Exception:
         return os.getenv(name, default)
 
+def available_model(key, preferred=""):
+    """Resolve a text-generation model actually listed for this API key."""
+    names = []
+    page = None
+    for _ in range(10):
+        params = {"pageSize": 100}
+        if page:
+            params["pageToken"] = page
+        response = requests.get(
+            "https://generativelanguage.googleapis.com/v1beta/models",
+            headers={"x-goog-api-key": key},
+            params=params,
+            timeout=30,
+        )
+        if not response.ok:
+            raise RuntimeError(f"Gemini model lookup failed (HTTP {response.status_code}). Check API key access and quota.")
+        data = response.json()
+        for entry in data.get("models", []):
+            if "generateContent" in entry.get("supportedGenerationMethods", []):
+                names.append(entry.get("name", "").removeprefix("models/"))
+        page = data.get("nextPageToken")
+        if not page:
+            break
+    # Prefer economical text-only Flash models; avoid image/audio and live models.
+    candidates = [n for n in names if n.startswith("gemini-") and "flash" in n
+                  and not any(x in n for x in ("image", "audio", "tts", "live", "robot", "embedding", "vision", "exp", "thinking", "computer-use"))]
+    if preferred and preferred in candidates:
+        return preferred
+    if "gemini-flash-latest" in candidates:
+        return "gemini-flash-latest"
+    if not candidates:
+        raise RuntimeError("No compatible Gemini Flash text-generation model is available to this API key.")
+    def rank(name):
+        import re
+        version = re.match(r"gemini-(\d+)(?:\.(\d+))?", name)
+        number = (int(version.group(1)), int(version.group(2) or 0)) if version else (0, 0)
+        return ("preview" not in name, "lite" not in name, number, name)
+    return max(candidates, key=rank)
+
+
 def classify(batch, key, model):
     # Treat public feedback as untrusted input, never as instructions.
     prompt = (
@@ -75,7 +115,7 @@ def classify(batch, key, model):
             value = item.get(field)
             if value not in allowed:
                 flags.append("invalid " + field)
-                value = "unknown" if "unknown" in allowed else ("no_statement" if field == "repeat_behavior" else "no_clear_signal")
+                value = "unknown" if "unknown" in allowed else ("no_statement" if field == "repeat_behavior" else ("unclear" if field == "anchor_relevance" else "no_clear_signal"))
             out[field] = value
         excerpt = item.get("evidence", "")
         if not isinstance(excerpt, str) or not excerpt.strip() or excerpt not in src["feedback"] or len(excerpt) > 180:
@@ -116,7 +156,7 @@ if df.empty:
     st.stop()
 
 key = secret("GEMINI_API_KEY")
-model = str(secret("GEMINI_MODEL", "gemini-2.5-flash")).removeprefix("models/")
+preferred_model = str(secret("GEMINI_MODEL", "")).removeprefix("models/")
 if not key:
     st.info("Owner must configure GEMINI_API_KEY in Streamlit Secrets to enable AI analysis.")
     st.stop()
@@ -124,6 +164,12 @@ limit = st.number_input("Items to analyze", min_value=1, max_value=min(len(df), 
 chosen = df.head(int(limit))
 st.caption("The first selected rows are analyzed in batches of 5. The model receives public feedback text and IDs only. Uploaded content must be permitted for this use.")
 if st.button("Run AI discovery", type="primary"):
+    try:
+        model = available_model(key, preferred_model)
+    except (RuntimeError, requests.RequestException, ValueError) as exc:
+        st.error(str(exc) if isinstance(exc, RuntimeError) else "Unable to retrieve available Gemini models. Please try again.")
+        st.stop()
+    st.session_state["analysis_model"] = model
     records = []
     failures = []
     progress = st.progress(0)
@@ -144,6 +190,7 @@ if st.button("Run AI discovery", type="primary"):
     st.session_state["analysis_total"] = len(chosen)
 if "analysis_result" not in st.session_state:
     st.stop()
+st.caption("AI model used: " + st.session_state.get("analysis_model", "unknown"))
 results = pd.DataFrame(st.session_state["analysis_result"])
 for error in st.session_state.get("analysis_failures", []):
     st.error(error)
