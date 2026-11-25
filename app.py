@@ -1,5 +1,6 @@
 import json
 import os
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -28,8 +29,8 @@ def secret(name, default=""):
     except Exception:
         return os.getenv(name, default)
 
-def available_model(key, preferred=""):
-    """Resolve a text-generation model actually listed for this API key."""
+def available_models(key, preferred=""):
+    """Return ranked text-generation models actually listed for this API key."""
     names = []
     page = None
     for _ in range(10):
@@ -54,18 +55,53 @@ def available_model(key, preferred=""):
     # Prefer economical text-only Flash models; avoid image/audio and live models.
     candidates = [n for n in names if n.startswith("gemini-") and "flash" in n
                   and not any(x in n for x in ("image", "audio", "tts", "live", "robot", "embedding", "vision", "exp", "thinking", "computer-use"))]
-    if preferred and preferred in candidates:
-        return preferred
-    if "gemini-flash-latest" in candidates:
-        return "gemini-flash-latest"
     if not candidates:
         raise RuntimeError("No compatible Gemini Flash text-generation model is available to this API key.")
     def rank(name):
         import re
         version = re.match(r"gemini-(\d+)(?:\.(\d+))?", name)
         number = (int(version.group(1)), int(version.group(2) or 0)) if version else (0, 0)
-        return ("preview" not in name, "lite" not in name, number, name)
-    return max(candidates, key=rank)
+        stable = "preview" not in name and "latest" not in name
+        return (stable, "lite" in name, number, name)
+    ranked = sorted(set(candidates), key=rank, reverse=True)
+    if preferred in ranked:
+        ranked.remove(preferred)
+        ranked.insert(0, preferred)
+    return ranked
+
+
+class GeminiRequestError(RuntimeError):
+    def __init__(self, status):
+        self.status = status
+        super().__init__(f"Gemini request failed (HTTP {status}).")
+
+
+def classify_with_fallback(batch, key, models):
+    """Retry transient failures and switch to a listed alternative; bound API usage."""
+    attempts = []
+    for model in models[:3]:
+        for attempt in range(2):
+            try:
+                rows = classify(batch, key, model)
+                for row in rows:
+                    row["ai_model"] = model
+                return rows, model
+            except GeminiRequestError as exc:
+                attempts.append(f"{model}: HTTP {exc.status}")
+                if exc.status in (401, 403):
+                    raise RuntimeError("Gemini denied access. Check API key permissions.") from None
+                if exc.status not in (400, 404, 429, 500, 502, 503, 504):
+                    raise RuntimeError(f"Gemini request failed (HTTP {exc.status}).") from None
+                if exc.status in (400, 404, 429):
+                    break
+            except (requests.Timeout, requests.ConnectionError):
+                attempts.append(f"{model}: connection or timeout")
+            except (ValueError, KeyError, IndexError, TypeError):
+                attempts.append(f"{model}: unusable AI response")
+                break
+            if attempt == 0:
+                time.sleep(2)
+    raise RuntimeError("No usable response from available models. " + "; ".join(attempts) + ". Try again later if service or quota is unavailable.")
 
 
 def classify(batch, key, model):
@@ -95,7 +131,7 @@ def classify(batch, key, model):
         timeout=120,
     )
     if not response.ok:
-        raise RuntimeError("AI request failed (HTTP " + str(response.status_code) + "). Check model, key and quota.")
+        raise GeminiRequestError(response.status_code)
     raw = response.json()["candidates"][0]["content"]["parts"][0]["text"]
     parsed = json.loads(raw)
     if not isinstance(parsed, list):
@@ -165,19 +201,21 @@ chosen = df.head(int(limit))
 st.caption("The first selected rows are analyzed in batches of 5. The model receives public feedback text and IDs only. Uploaded content must be permitted for this use.")
 if st.button("Run AI discovery", type="primary"):
     try:
-        model = available_model(key, preferred_model)
+        models = available_models(key, preferred_model)
     except (RuntimeError, requests.RequestException, ValueError) as exc:
         st.error(str(exc) if isinstance(exc, RuntimeError) else "Unable to retrieve available Gemini models. Please try again.")
         st.stop()
-    st.session_state["analysis_model"] = model
     records = []
+    used_models = set()
     failures = []
     progress = st.progress(0)
     for start in range(0, len(chosen), 5):
         block = chosen.iloc[start:start+5]
         try:
             payload = block[["id", "feedback", "representation"]].to_dict("records")
-            results = classify(payload, key, model)
+            results, model = classify_with_fallback(payload, key, models)
+            used_models.add(model)
+            models = [model] + [m for m in models if m != model]
             metadata = block.set_index("id")[["source", "date", "url"]]
             for record in results:
                 record.update(metadata.loc[record["id"]].to_dict())
@@ -185,6 +223,9 @@ if st.button("Run AI discovery", type="primary"):
         except Exception as e:
             failures.append(f"Rows {start+1}–{min(start+5,len(chosen))}: {type(e).__name__}" + (": " + str(e) if isinstance(e, (RuntimeError, ValueError)) else ""))
         progress.progress(min((start+5)/len(chosen), 1.0))
+        if not records and failures:
+            break
+    st.session_state["analysis_model"] = ", ".join(sorted(used_models)) or "No successful response"
     st.session_state["analysis_result"] = records
     st.session_state["analysis_failures"] = failures
     st.session_state["analysis_total"] = len(chosen)
