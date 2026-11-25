@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import time
@@ -62,11 +63,17 @@ def available_models(key, preferred=""):
         version = re.match(r"gemini-(\d+)(?:\.(\d+))?", name)
         number = (int(version.group(1)), int(version.group(2) or 0)) if version else (0, 0)
         stable = "preview" not in name and "latest" not in name
-        return (stable, "lite" in name, number, name)
+        return (stable, number, "lite" in name, name)
     ranked = sorted(set(candidates), key=rank, reverse=True)
+    preferred = preferred or "gemini-3.1-flash-lite"
     if preferred in ranked:
         ranked.remove(preferred)
         ranked.insert(0, preferred)
+    # Include a non-Lite alternative rather than only trying older Lite models.
+    alternative = next((n for n in ranked if "lite" not in n), None)
+    if alternative and ranked.index(alternative) > 2:
+        ranked.remove(alternative)
+        ranked.insert(2, alternative)
     return ranked
 
 
@@ -100,7 +107,7 @@ def classify_with_fallback(batch, key, models):
                 attempts.append(f"{model}: unusable AI response")
                 break
             if attempt == 0:
-                time.sleep(2)
+                time.sleep(5)
     raise RuntimeError("No usable response from available models. " + "; ".join(attempts) + ". Try again later if service or quota is unavailable.")
 
 
@@ -193,51 +200,99 @@ if df.empty:
 
 key = secret("GEMINI_API_KEY")
 preferred_model = str(secret("GEMINI_MODEL", "")).removeprefix("models/")
-if not key:
-    st.info("Owner must configure GEMINI_API_KEY in Streamlit Secrets to enable AI analysis.")
-    st.stop()
+dataset_id = hashlib.sha256(df.to_csv(index=False).encode("utf-8")).hexdigest()
+if st.session_state.get("checkpoint_dataset") != dataset_id:
+    st.session_state["checkpoint_dataset"] = dataset_id
+    st.session_state["checkpoint_records"] = {}
+    st.session_state["checkpoint_failures"] = []
+    st.session_state["checkpoint_model"] = ""
+saved = st.session_state["checkpoint_records"]
+
 limit = st.number_input("Items to analyze", min_value=1, max_value=min(len(df), 100), value=min(len(df), 40))
 chosen = df.head(int(limit))
-st.caption("The first selected rows are analyzed in batches of 5. The model receives public feedback text and IDs only. Uploaded content must be permitted for this use.")
-if st.button("Run AI discovery", type="primary"):
-    try:
-        models = available_models(key, preferred_model)
-    except (RuntimeError, requests.RequestException, ValueError) as exc:
-        st.error(str(exc) if isinstance(exc, RuntimeError) else "Unable to retrieve available Gemini models. Please try again.")
-        st.stop()
-    records = []
-    used_models = set()
-    failures = []
-    progress = st.progress(0)
-    for start in range(0, len(chosen), 5):
-        block = chosen.iloc[start:start+5]
+st.caption("Analysis runs in batches of 5. Successful batches are retained in this session. If a request fails, resume from the remaining items rather than restarting. Download a CSV checkpoint before closing or refreshing the app.")
+
+with st.expander("Restore a previous analysis (optional)"):
+    checkpoint = st.file_uploader("Upload a previously downloaded AI labels CSV", type=["csv"], key="checkpoint_upload")
+    if st.button("Restore previous results", disabled=checkpoint is None):
         try:
-            payload = block[["id", "feedback", "representation"]].to_dict("records")
-            results, model = classify_with_fallback(payload, key, models)
-            used_models.add(model)
-            models = [model] + [m for m in models if m != model]
-            metadata = block.set_index("id")[["source", "date", "url"]]
-            for record in results:
-                record.update(metadata.loc[record["id"]].to_dict())
-            records.extend(results)
-        except Exception as e:
-            failures.append(f"Rows {start+1}–{min(start+5,len(chosen))}: {type(e).__name__}" + (": " + str(e) if isinstance(e, (RuntimeError, ValueError)) else ""))
-        progress.progress(min((start+5)/len(chosen), 1.0))
-        if not records and failures:
-            break
-    st.session_state["analysis_model"] = ", ".join(sorted(used_models)) or "No successful response"
-    st.session_state["analysis_result"] = records
-    st.session_state["analysis_failures"] = failures
-    st.session_state["analysis_total"] = len(chosen)
-if "analysis_result" not in st.session_state:
-    st.stop()
-st.caption("AI model used: " + st.session_state.get("analysis_model", "unknown"))
-results = pd.DataFrame(st.session_state["analysis_result"])
-for error in st.session_state.get("analysis_failures", []):
-    st.error(error)
+            old = pd.read_csv(checkpoint, dtype=str).fillna("")
+            required = COLUMNS + list(LABELS) + ["evidence", "need", "opportunity", "limitation", "city", "validation", "ai_model"]
+            if not set(required).issubset(old.columns):
+                raise ValueError("This is not a compatible AI labels CSV.")
+            if old.id.duplicated().any():
+                raise ValueError("Checkpoint contains duplicate IDs.")
+            source_rows = df.set_index("id", drop=False).to_dict("index")
+            restored = {}
+            for row in old[required].to_dict("records"):
+                original = source_rows.get(row["id"])
+                if original is None or any(row[c] != original[c] for c in COLUMNS):
+                    raise ValueError("Checkpoint does not match the current source dataset.")
+                if any(row[field] not in allowed for field, allowed in LABELS.items()):
+                    raise ValueError("Checkpoint contains invalid categorical labels.")
+                excerpt = row["evidence"]
+                if not excerpt.strip() or excerpt not in original["feedback"] or len(excerpt) > 180:
+                    row["evidence"] = ""
+                    row["validation"] = "missing or nonverbatim evidence"
+                elif not row["validation"].strip():
+                    row["validation"] = "validation status missing"
+                row["result_origin"] = "restored CSV; provenance not independently authenticated"
+                restored[row["id"]] = row
+            for ident, row in restored.items():
+                if ident not in saved:
+                    saved[ident] = row
+            st.session_state["checkpoint_records"] = saved
+            st.session_state["checkpoint_failures"] = []
+            st.success(f"Restored {len(restored)} matching items. Imported labels still require human validation.")
+        except Exception as exc:
+            st.error(str(exc) if isinstance(exc, ValueError) else "Could not restore this CSV.")
+
+pending = chosen[~chosen.id.isin(saved)]
+if not key:
+    st.info("Owner must configure GEMINI_API_KEY in Streamlit Secrets to enable new AI analysis.")
+progress = st.progress((len(chosen) - len(pending)) / len(chosen))
+if st.button("Run / resume AI discovery", type="primary", disabled=not key or pending.empty):
+    failures = []
+    try:
+        models = available_models(key, preferred_model or st.session_state["checkpoint_model"])
+    except (RuntimeError, requests.RequestException, ValueError) as exc:
+        models = []
+        failures.append(str(exc) if isinstance(exc, RuntimeError) else "Unable to retrieve available Gemini models. Please try again.")
+    if models:
+        for start in range(0, len(pending), 5):
+            block = pending.iloc[start:start+5]
+            try:
+                payload = block[["id", "feedback", "representation"]].to_dict("records")
+                batch_rows, model = classify_with_fallback(payload, key, models)
+                models = [model] + [m for m in models if m != model]
+                st.session_state["checkpoint_model"] = model
+                metadata = block.set_index("id")[["source", "date", "url"]]
+                for record in batch_rows:
+                    record.update(metadata.loc[record["id"]].to_dict())
+                    record["result_origin"] = "live AI response"
+                    saved[record["id"]] = record
+                st.session_state["checkpoint_records"] = saved
+                progress.progress(sum(ident in saved for ident in chosen.id) / len(chosen))
+            except Exception as exc:
+                failures.append(f"Batch {', '.join(block.id)} paused: " + (str(exc) if isinstance(exc, (RuntimeError, ValueError)) else type(exc).__name__))
+                break
+    st.session_state["checkpoint_failures"] = failures
+
+results = pd.DataFrame([saved[ident] for ident in chosen.id if ident in saved])
+completed = len(results)
+st.session_state["analysis_total"] = len(chosen)
+st.metric("Analysis progress", f"{completed}/{len(chosen)}")
+for error in st.session_state["checkpoint_failures"]:
+    st.warning(error)
+if completed < len(chosen):
+    st.info("Analysis is incomplete. If Gemini is unavailable, try Run / resume AI discovery later. Completed items will not be requested again in this session.")
 if results.empty:
-    st.error("No valid AI labels returned. No findings can be reported.")
     st.stop()
+st.caption("AI model(s) recorded: " + ", ".join(sorted(set(results.ai_model.astype(str)))))
+if completed == len(chosen):
+    st.success("All selected items have AI labels. Human validation is still required.")
+else:
+    st.warning("The tables below are partial results only. Download the CSV to preserve completed items.")
 st.subheader("Evidence coverage and quality")
 reliable = results.validation.eq("format and excerpt checks passed")
 core = results[reliable & results.anchor_relevance.eq("core_category") & results.speaker.eq("firsthand")]
